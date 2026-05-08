@@ -10,7 +10,9 @@ Your job is to:
 * Provide LLVM-IR that exposes the bug and produces a mis-compilation
 * Provide a fix for the bug (but DO NOT MODIFY the source code)
 
-Keep `analysis.md` updated with your progress and findings.
+Please write your analysis into the next unwritten file under `analysis/`. E.g. `analysis/2026-05-08-alias-analysis-XX.md` where `XX` is the next available number.
+Keep the analysis file updatead as you progress.
+Make sure to update it when you've found a candidate bug, not just when you've finished your analysis.
 
 ## Resources
 
@@ -43,3 +45,4 @@ Please read the following documents which analyze other bugs in the alias analys
 [Analysis 7](/home/terrelln/.llms/2026-05-08-alias-analysis-7.md)
 [Analysis 8](/home/terrelln/.llms/2026-05-08-alias-analysis-8.md)
 [Analysis 9](/home/terrelln/.llms/2026-05-08-alias-analysis-9.md)
+[Analysis 10](/home/terrelln/.llms/2026-05-08-alias-analysis-10.md)
