@@ -211,6 +211,24 @@ ModRefInfo AAResults::getModRefInfo(const Instruction *I, const CallBase *Call2,
   // If this is a fence, just return ModRef.
   if (I->isFenceLike())
     return ModRefInfo::ModRef;
+  // Atomic operations with stronger-than-relaxed ordering have synchronization
+  // properties that affect arbitrary addresses, not just the location they
+  // access. Mirror the checks performed by the instruction-specific handlers
+  // (LoadInst/StoreInst/AtomicCmpXchgInst/AtomicRMWInst) so the dispatch path
+  // through this overload is just as conservative.
+  if (const auto *LI = dyn_cast<LoadInst>(I)) {
+    if (isStrongerThan(LI->getOrdering(), AtomicOrdering::Unordered))
+      return ModRefInfo::ModRef;
+  } else if (const auto *SI = dyn_cast<StoreInst>(I)) {
+    if (isStrongerThan(SI->getOrdering(), AtomicOrdering::Unordered))
+      return ModRefInfo::ModRef;
+  } else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
+    if (isStrongerThanMonotonic(CX->getSuccessOrdering()))
+      return ModRefInfo::ModRef;
+  } else if (const auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
+    if (isStrongerThanMonotonic(RMW->getOrdering()))
+      return ModRefInfo::ModRef;
+  }
   // Otherwise, check if the call modifies or references the
   // location this memory access defines.  The best we can say
   // is that if the call references what this instruction
