@@ -34,15 +34,5 @@ There is a local build of LLVM under `./build/` that you can use to test your re
 
 ## Prior Work
 
-Please read the following documents which analyze other bugs in the alias analysis module. Please don't re-report bugs with the same underlying issue. But, if you find similar bugs in different code paths, that is great!
-
-[Analysis 1](/home/terrelln/.llms/2026-05-08-alias-analysis.md)
-[Analysis 2](/home/terrelln/.llms/2026-05-08-alias-analysis-2.md)
-[Analysis 3](/home/terrelln/.llms/2026-05-08-alias-analysis-3.md)
-[Analysis 4](/home/terrelln/.llms/2026-05-08-alias-analysis-4.md)
-[Analysis 5](/home/terrelln/.llms/2026-05-08-alias-analysis-5.md)
-[Analysis 6](/home/terrelln/.llms/2026-05-08-alias-analysis-6.md)
-[Analysis 7](/home/terrelln/.llms/2026-05-08-alias-analysis-7.md)
-[Analysis 8](/home/terrelln/.llms/2026-05-08-alias-analysis-8.md)
-[Analysis 9](/home/terrelln/.llms/2026-05-08-alias-analysis-9.md)
-[Analysis 10](/home/terrelln/.llms/2026-05-08-alias-analysis-10.md)
+Please read all the documents under `./analysis/` which analyze other bugs in the alias analysis module.
+Please don't re-report bugs with the same underlying issue. But, if you find similar bugs in different code paths, that is great!

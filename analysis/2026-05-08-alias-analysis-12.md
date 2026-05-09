@@ -1,224 +1,136 @@
-# Alias Analysis Bug: `aliasErrno()` Treats Upper-Bound Access Sizes as Definite
+# BasicAA bug: `extern_weak` globals are treated as disjoint even when they can both be null
+
+NOTE: gcc has this same behavior. And writing to a NULL weak pointer is super weird, so I'm not sure if this is a bug or not.
 
 ## Summary
 
-`BasicAAResult::aliasErrno()` in `llvm/lib/Analysis/BasicAliasAnalysis.cpp:1888`
-uses `Loc.Size.hasValue()` instead of `Loc.Size.isPrecise()` to guard a size-based
-exclusion. An upper-bound `LocationSize` (from e.g. `llvm.masked.load`) may
-represent an access as small as zero bytes, yet `aliasErrno()` treats the upper
-bound as the actual access size. When the upper bound exceeds `sizeof(int)`, the
-function incorrectly returns `NoAlias`, dropping errno effects from the call's
-`ModRefInfo`. EarlyCSE or GVN can then CSE or forward stale values across a call
-that writes `errno`.
+BasicAA can return `NoAlias` for two distinct `extern_weak` global variables even in a function where address-space 0 null is a valid memory location. This is unsound: LangRef says an unresolved `extern_weak` symbol becomes null, and `null_pointer_is_valid` says null is a valid address for loads and stores. If two weak globals are both unresolved, both pointers denote the same null address and memory operations through them alias.
 
-## Bug Location
+This is not an integer-overflow issue and does not require large values. Clang can emit the relevant IR from ordinary weak declarations when compiled with `-fno-delete-null-pointer-checks`.
 
-**File:** `llvm/lib/Analysis/BasicAliasAnalysis.cpp`, lines 1883-1895
+## Root cause
 
-```cpp
-AliasResult BasicAAResult::aliasErrno(const MemoryLocation &Loc,
-                                      const Module *M) {
-  if (Loc.Size.hasValue() &&
-      Loc.Size.getValue().getKnownMinValue() * 8 > TLI.getIntSize())
-    return AliasResult::NoAlias;
+`llvm::isIdentifiedObject()` currently treats every non-alias `GlobalValue` as an identified object:
 
-  if (isIdentifiedFunctionLocal(getUnderlyingObject(Loc.Ptr)))
-    return AliasResult::NoAlias;
-  return AliasResult::MayAlias;
-}
-```
-
-`hasValue()` returns true for BOTH `LocationSize::precise(N)` and
-`LocationSize::upperBound(N)` (confirmed at `MemoryLocation.h:153` — it only
-checks against `AfterPointer` and `BeforeOrAfterPointer`). The check on line
-1888 should use `isPrecise()` instead, because an upper-bound size of N means
-the access may touch anywhere from 0 to N bytes. Only a *precise* size can
-prove the access is strictly larger than `errno`.
-
-## How the Upper-Bound Size Arises
-
-`MemoryLocation::getForArgument()` at `MemoryLocation.cpp:244-252` produces
-upper-bound sizes for `llvm.masked.load` when the mask is not a recognized
-`get.active.lane.mask` intrinsic:
-
-```cpp
-case Intrinsic::masked_load: {
-  auto *Ty = cast<VectorType>(II->getType());
-  if (auto KnownType = getKnownTypeFromMaskedOp(II->getOperand(1), Ty))
-    return MemoryLocation(Arg, DL.getTypeStoreSize(*KnownType), AATags);
-  return MemoryLocation(
-      Arg, LocationSize::upperBound(DL.getTypeStoreSize(Ty)), AATags);
-}
-```
-
-A `<8 x i8>` masked load with a constant mask `<1,1,1,1,0,0,0,0>` gets
-`LocationSize::upperBound(8)`, even though only 4 bytes are actually read.
-
-## Trigger Path
-
-1. `@llvm.masked.load.v8i8.p0` is modeled as `memory(argmem: read)`.
-2. Its pointer argument location is `LocationSize::upperBound(8)`.
-3. A call declared `memory(errnomem: write)` has `ErrnoMR = Mod`.
-4. `BasicAAResult::getModRefInfo(Call, Loc)` at line 1008 tries to refine
-   errno effects:
-   ```cpp
-   if ((ErrnoMR | Result) != Result) {
-     if (AAQI.AAR.aliasErrno(Loc, Call->getModule()) != AliasResult::NoAlias)
-       Result |= ErrnoMR;
-   }
-   ```
-5. `aliasErrno()` sees `8 * 8 = 64 > 32` (x86-64, 32-bit int) and returns
-   `NoAlias`.
-6. The errno write is dropped → result is `NoModRef`.
-7. MemorySSA sees no clobber. EarlyCSE CSEs the two masked loads.
-
-## LLVM-IR Proof
-
-```llvm
-; RUN: opt -aa-pipeline=basic-aa -passes='early-cse<memssa>' -S < %s | FileCheck %s
-
-target triple = "x86_64-unknown-linux-gnu"
-
-declare void @set_errno() memory(errnomem: write)
-
-define <8 x i8> @errno_upperbound_cse(ptr %p) {
-; Correct: both loads must survive — @set_errno may change bytes [0,4) at %p.
-; Buggy: %v2 is CSE'd with %v1, sub folds to zeroinitializer.
-;
-; CHECK-LABEL: define <8 x i8> @errno_upperbound_cse(
-; CHECK:         %v1 = call <8 x i8> @llvm.masked.load
-; CHECK:         call void @set_errno()
-; CHECK:         %v2 = call <8 x i8> @llvm.masked.load
-; CHECK:         %diff = sub <8 x i8> %v2, %v1
-; CHECK:         ret <8 x i8> %diff
-  %v1 = call <8 x i8> @llvm.masked.load.v8i8.p0(
-      ptr %p, i32 1,
-      <8 x i1> <i1 true, i1 true, i1 true, i1 true,
-                 i1 false, i1 false, i1 false, i1 false>,
-      <8 x i8> zeroinitializer)
-
-  call void @set_errno()
-
-  %v2 = call <8 x i8> @llvm.masked.load.v8i8.p0(
-      ptr %p, i32 1,
-      <8 x i1> <i1 true, i1 true, i1 true, i1 true,
-                 i1 false, i1 false, i1 false, i1 false>,
-      <8 x i8> zeroinitializer)
-
-  %diff = sub <8 x i8> %v2, %v1
-  ret <8 x i8> %diff
-}
-```
-
-## Verified Miscompilation
-
-```
-$ build/bin/opt -aa-pipeline=basic-aa -passes='early-cse<memssa>' -S test.ll
-```
-
-Output (miscompiled):
-```llvm
-define <8 x i8> @errno_upperbound_cse(ptr %p) {
-  %v1 = call <8 x i8> @llvm.masked.load.v8i8.p0(...)
-  call void @set_errno()
-  ret <8 x i8> zeroinitializer
-}
-```
-
-EarlyCSE replaced `%v2` with `%v1` and folded `sub %v1, %v1` to
-`zeroinitializer`. If `%p` points to `errno` and `@set_errno` writes a
-different value, the correct result is non-zero but the program always returns
-zero.
-
-## Why EarlyCSE Miscompiles
-
-MemorySSA asks whether the `@set_errno` memory def clobbers the later masked
-load. In `MemorySSA.cpp:313-315`:
-
-```cpp
-if (auto *CB = dyn_cast_or_null<CallBase>(UseInst)) {
-  ModRefInfo I = AA.getModRefInfo(DefInst, CB);
-  return isModSet(I);
-}
-```
-
-The bad alias result makes `AA.getModRefInfo(@set_errno, masked_load)` return
-`NoModRef`, so MemorySSA reports no clobber. EarlyCSE with MemorySSA then
-treats the two masked loads as the same memory generation and replaces the
-later one with the earlier one.
-
-## Fix
-
-Only use the size-based errno exclusion for precise access sizes:
-
-```cpp
-AliasResult BasicAAResult::aliasErrno(const MemoryLocation &Loc,
-                                      const Module *M) {
-  if (Loc.Size.isPrecise() && Loc.Size.hasValue() &&
-      Loc.Size.getValue().getKnownMinValue() * 8 > TLI.getIntSize())
-    return AliasResult::NoAlias;
-
-  if (isIdentifiedFunctionLocal(getUnderlyingObject(Loc.Ptr)))
-    return AliasResult::NoAlias;
-  return AliasResult::MayAlias;
-}
-```
-
-Only precise sizes can prove the access is strictly larger than `errno`. For
-upper-bound sizes, the actual access might be as small as `sizeof(int)` or
-smaller, so we cannot exclude an alias with `errno`.
-
-## Secondary Finding: `MergeAliasResults` Silently Drops Offset Accuracy
-
-`MergeAliasResults()` at `BasicAliasAnalysis.cpp:1429` uses
-`AliasResult::operator==` which only compares the `Alias` field, ignoring
-the `Offset`:
-
-```cpp
-static AliasResult MergeAliasResults(AliasResult A, AliasResult B) {
-  if (A == B)
-    return A;   // Returns A's offset even when B has a different offset
+```c++
+// llvm/lib/Analysis/AliasAnalysis.cpp
+bool llvm::isIdentifiedObject(const Value *V) {
+  if (isa<AllocaInst>(V))
+    return true;
+  if (isa<GlobalValue>(V) && !isa<GlobalAlias>(V))
+    return true;
   ...
 }
 ```
 
-When `aliasSelect` or `aliasPHI` merges two `PartialAlias` results with
-different offsets (e.g., offset=4 from one arm and offset=8 from the other),
-`MergeAliasResults` returns one arm's offset arbitrarily. This violates the
-invariant that the `PartialAlias` offset accurately represents the pointer
-relationship.
+BasicAA then uses that helper to conclude that different identified objects cannot alias:
 
-**Current impact:** Benign. All current consumers have safeguards:
-
-- **GVN:** For load-to-load forwarding via `ClobberOffset`, the useful case
-  (query load nested within dep load) always produces a negative offset from
-  `alias(QueryLoc, DepLoc)`, which GVN discards. The fallback
-  `analyzeLoadFromClobberingLoad` also fails for select/phi pointers.
-
-- **DSE `OW_Complete`:** The PartialAlias offset is only set when the nesting
-  condition `Off + RightSize <= LeftSize` holds in `aliasGEP`. This nesting
-  condition IS the same as DSE's `Off + DeadSize <= KillingSize` check. So
-  if both arms produce PartialAlias with offset, BOTH satisfy OW_Complete
-  regardless of which offset is chosen.
-
-- **DSE `OW_PartialEarlierWithFullLater`:** The geometry required (killing
-  store smaller, dead store larger) is incompatible with the nesting check
-  direction in `aliasGEP`, so this path is never reached via PartialAlias
-  offsets from select/phi merges.
-
-**Recommended fix:** Drop the offset when both results are `PartialAlias`
-with different offsets:
-
-```cpp
-static AliasResult MergeAliasResults(AliasResult A, AliasResult B) {
-  if (A == B) {
-    if (A == AliasResult::PartialAlias &&
-        A.hasOffset() && B.hasOffset() &&
-        A.getOffset() != B.getOffset()) {
-      return AliasResult::PartialAlias;  // no offset
-    }
-    return A;
-  }
+```c++
+// llvm/lib/Analysis/BasicAliasAnalysis.cpp
+if (O1 != O2) {
+  if (isIdentifiedObject(O1) && isIdentifiedObject(O2))
+    return AliasResult::NoAlias;
   ...
 }
 ```
+
+That rule misses the special `extern_weak` case. LangRef says:
+
+```text
+extern_weak:
+  ... if not linked, the symbol becomes null instead of being an undefined reference.
+```
+
+and for `null_pointer_is_valid`:
+
+```text
+the null address in address-space 0 is considered to be a valid address for memory loads and stores.
+```
+
+So two distinct `extern_weak` globals are not necessarily two distinct storage objects in a null-valid function.
+
+## LLVM IR reproducer
+
+```llvm
+@x = extern_weak global i8
+@y = extern_weak global i8
+
+define i8 @extern_weak_null_alias() null_pointer_is_valid {
+entry:
+  store i8 7, ptr @x
+  store i8 42, ptr @y
+  %v = load i8, ptr @x
+  ret i8 %v
+}
+```
+
+If both weak symbols are unresolved, both `@x` and `@y` are null. Since null is valid in this function, the second store overwrites the first store and the function should return `42`.
+
+BasicAA says the locations do not alias:
+
+```text
+$ build/bin/opt -aa-pipeline=basic-aa -passes=aa-eval \
+    -print-all-alias-modref-info -disable-output -S repro.ll
+
+Function: extern_weak_null_alias: 2 pointers, 0 call sites
+  NoAlias: i8* @x, i8* @y
+```
+
+GVN consumes that answer and folds the load to the first store:
+
+```text
+$ build/bin/opt -aa-pipeline=basic-aa \
+    -passes='gvn,instcombine,simplifycfg' -S repro.ll
+
+define i8 @extern_weak_null_alias() #0 {
+entry:
+  store i8 7, ptr @x, align 1
+  store i8 42, ptr @y, align 1
+  ret i8 7
+}
+```
+
+That optimized result is wrong for the valid execution where both weak symbols resolve to null and null memory is valid.
+
+## C source path
+
+Clang emits the same shape from C:
+
+```c
+extern char x __attribute__((weak));
+extern char y __attribute__((weak));
+
+int f(void) {
+  x = 7;
+  y = 42;
+  return x;
+}
+```
+
+With:
+
+```text
+build/bin/clang -S -emit-llvm -O2 -fno-delete-null-pointer-checks repro.c
+```
+
+the function has `null_pointer_is_valid`, both globals are `extern_weak`, and the return is folded to `7`. In an environment where address zero is mapped and writable, the source program writes `7` to address zero, writes `42` to the same address, and should return `42`.
+
+## Proposed fix
+
+Do not use the generic "different identified objects" shortcut for `extern_weak` globals when the weak symbol can become a dereferenceable null pointer.
+
+A conservative fix is to stop treating `extern_weak` `GlobalValue`s as identified objects in `isIdentifiedObject()`. A more precise fix is to keep the existing precision for ordinary globals, but in `BasicAAResult::aliasCheck()` suppress the `isIdentifiedObject(O1) && isIdentifiedObject(O2)` `NoAlias` result when either underlying object is an `extern_weak` `GlobalValue` whose address space has a valid null pointer in the current function:
+
+```c++
+auto IsExternWeakWithValidNull = [&](const Value *V) {
+  auto *GV = dyn_cast<GlobalValue>(V);
+  return GV && GV->hasExternalWeakLinkage() &&
+         NullPointerIsDefined(&F, GV->getAddressSpace());
+};
+
+if (isIdentifiedObject(O1) && isIdentifiedObject(O2) &&
+    !IsExternWeakWithValidNull(O1) && !IsExternWeakWithValidNull(O2))
+  return AliasResult::NoAlias;
+```
+
+This also covers non-zero address spaces, where LLVM does not generally assume a zero bit-pattern is non-dereferenceable.
