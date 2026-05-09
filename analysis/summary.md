@@ -1,7 +1,7 @@
 # Alias Analysis Submission Summary
 
 This reviews `prompt.md` and the submissions in `analysis/01` through
-`analysis/18`. I ignored `analysis/19` as a submission, but I did audit nearby
+`analysis/20`. I ignored `analysis/19` as a submission, but I did audit nearby
 code paths for logical extensions of the reported issues.
 
 Validation was based on source inspection and local `build/bin/opt` runs. Where
@@ -19,6 +19,7 @@ counting it as a confirmed miscompile.
 | High | 05 | Confirmed real miscompile | New-format TBAA access sizes are ignored; GVN forwards across an overlapping wide access. |
 | Medium-high | 04 | Confirmed real bug | `aliasErrno()` treats upper-bound access sizes as exact and drops `errnomem` effects. |
 | Medium-high | 18 | Confirmed real miscompile | BasicAA drops argmem effects for vector-of-pointer operands such as vector histogram intrinsics. |
+| Medium-high | 20 | Confirmed real bug | TBAA call metadata drops explicit `errnomem` effects. |
 | Medium | 11 | Confirmed real bug | `GlobalsAA` function summaries ignore operand-bundle heap effects. IR-only trigger. |
 | Medium | 15 | Confirmed real bug | TBAA call metadata suppresses unknown operand-bundle effects. IR-only trigger. |
 | Medium-low | 12 | Confirmed real but niche | Distinct `extern_weak` globals can both resolve to valid null in `null_pointer_is_valid` functions. |
@@ -290,7 +291,7 @@ for a direction that should have the positive offset. Current GVN and DSE
 consumers guard against negative offsets before using them, so this is a missed
 optimization / invariant violation rather than a demonstrated miscompile.
 
-### 6. TBAA And Operand-Bundle Modeling
+### 6. TBAA, Operand-Bundles, And Implicit Effects
 
 **Analysis 05: new-format TBAA access size ignored**
 
@@ -336,6 +337,38 @@ The supplied `analysis/15/reproducer.ll` shows the contrast:
 This is a distinct code path from analysis 11: the bad result comes from TBAA,
 not a GlobalsAA function summary.
 
+**Analysis 20: TBAA call metadata hides `errnomem` effects**
+
+This is confirmed. It is closely related to analysis 15, but the independent
+effect is explicit `ErrnoMem` rather than an unknown operand bundle. A call such
+as:
+
+```llvm
+declare void @touch_float(ptr) memory(argmem: read, errnomem: write)
+```
+
+may have a `float` TBAA tag for its ordinary argument-memory access while still
+writing `errno` independently. `TypeBasedAAResult::getModRefInfo(Call, Loc)`
+currently treats the call's `!tbaa` tag as applying to the whole call and
+returns `NoModRef` when the queried load has an `int` TBAA tag. That drops the
+explicit errno write even when `%errno_ptr` may be the address of `errno`.
+
+I verified both `analysis/20` reproducers:
+
+- `tbaa-errno.ll`: BasicAA alone keeps the two loads; `basic-aa,tbaa` folds the
+  function to `call @touch_float(...); ret i32 0`. MemorySSA shows the second
+  load as `MemoryUse(liveOnEntry)` instead of depending on the call def.
+- `tbaa-immutable-argmem-errno.ll`: the immutable-call
+  `getMemoryEffects(Call)` path returns `MemoryEffects::none()` for the whole
+  call, so MemorySSA does not even create a `MemoryDef` for an errno-writing
+  call.
+
+This is a real call-effect modeling bug. If TBAA wants to describe only the
+ordinary typed call access, it must preserve independent effects such as
+`ErrnoMem`. The existing `TypeBasedAAResult::aliasErrno()` support and
+`!llvm.errno.tbaa` named metadata make the intended separation visible:
+without errno-specific TBAA proving otherwise, `errno` effects must remain.
+
 **Analysis 16: scoped-noalias masking errno effects**
 
 The optimizer behavior reproduces: a call declared `memory(errnomem: write)`
@@ -362,10 +395,12 @@ The operand-bundle issue appears in multiple layers:
 - `TypeBasedAAResult::getModRefInfo(Call, Loc)`,
   `TypeBasedAAResult::getModRefInfo(Call, Call)`, and the immutable-type
   `getMemoryEffects(Call)` path can all suppress effects without preserving
-  operand-bundle memory.
+  operand-bundle memory or explicit `ErrnoMem` effects.
 
 Those TBAA call-vs-call and immutable-call paths should be included in any fix
-or regression audit.
+or regression audit. For errno specifically, the fix should reuse the same
+`aliasErrno()`/`!llvm.errno.tbaa` reasoning rather than letting ordinary call
+TBAA erase errno memory effects wholesale.
 
 ### 7. Writability Inference
 
@@ -399,9 +434,9 @@ alone.
 ## Verification Notes
 
 I ran the available checked reproducers for `analysis/11`, `analysis/15`,
-`analysis/17`, and `analysis/18`, and directly inspected the optimized output
-for `analysis/16`. I also ran inline `opt` reproducers for `01`, `02`, `03`,
-`04`, `05`, `06`, `07`, `08`, `10`, `12`, and `13`.
+`analysis/17`, `analysis/18`, and `analysis/20`, and directly inspected the
+optimized output for `analysis/16`. I also ran inline `opt` reproducers for
+`01`, `02`, `03`, `04`, `05`, `06`, `07`, `08`, `10`, `12`, and `13`.
 
 Key local observations:
 

@@ -1,5 +1,7 @@
 # Alias Analysis Bug: `getModRefInfo(Instruction, CallBase)` Bypasses Atomic Ordering Checks
 
+May be related to https://github.com/llvm/llvm-project/issues/41126
+
 ## Summary
 
 `AAResults::getModRefInfo(const Instruction *I, const CallBase *Call2)` does not
