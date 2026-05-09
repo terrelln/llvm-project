@@ -1,8 +1,8 @@
 # Alias Analysis Submission Summary
 
 This reviews `prompt.md` and the submissions in `analysis/01` through
-`analysis/17`. I ignored `analysis/18` and `analysis/19` as submissions, but I
-did audit nearby code paths for logical extensions of the reported issues.
+`analysis/18`. I ignored `analysis/19` as a submission, but I did audit nearby
+code paths for logical extensions of the reported issues.
 
 Validation was based on source inspection and local `build/bin/opt` runs. Where
 the optimizer behavior reproduces but the IR/source proof depends on invalid or
@@ -18,6 +18,7 @@ counting it as a confirmed miscompile.
 | High | 02 | Confirmed real miscompile | `getModRefInfo(Instruction, CallBase)` loses atomic ordering; Sink moves a call across a release store. |
 | High | 05 | Confirmed real miscompile | New-format TBAA access sizes are ignored; GVN forwards across an overlapping wide access. |
 | Medium-high | 04 | Confirmed real bug | `aliasErrno()` treats upper-bound access sizes as exact and drops `errnomem` effects. |
+| Medium-high | 18 | Confirmed real miscompile | BasicAA drops argmem effects for vector-of-pointer operands such as vector histogram intrinsics. |
 | Medium | 11 | Confirmed real bug | `GlobalsAA` function summaries ignore operand-bundle heap effects. IR-only trigger. |
 | Medium | 15 | Confirmed real bug | TBAA call metadata suppresses unknown operand-bundle effects. IR-only trigger. |
 | Medium-low | 12 | Confirmed real but niche | Distinct `extern_weak` globals can both resolve to valid null in `null_pointer_is_valid` functions. |
@@ -206,7 +207,51 @@ submissions through `17`, but it is a real logical extension of analysis 07.
 Ordinary `memcpy`/`memmove`/`memset` use a byte length directly in this code
 path, so they do not have this multiplication overflow shape there.
 
-### 4. BasicAA GEP Arithmetic And AliasResult Offsets
+### 4. Argmem Pointer-Vector Modeling
+
+**Analysis 18: vector histogram argmem refinement**
+
+This is confirmed. `BasicAAResult::getModRefInfo(Call, Loc)` refines
+`argmem` effects by iterating call data operands and only considering operands
+whose type is a scalar pointer:
+
+```cpp
+if (!Arg->getType()->isPointerTy())
+  continue;
+```
+
+The `llvm.experimental.vector.histogram.*` intrinsics are declared
+`memory(argmem: readwrite)`, but their memory operand is `<N x ptr>`. For an
+argmem-only histogram call, `OtherMR` is empty and the scalar-pointer-only loop
+leaves `NewArgMR` empty, so BasicAA replaces the whole argmem effect with
+`NoModRef`.
+
+I verified `analysis/18/histogram-vector-pointer.ll`:
+
+- `aa-eval` reports `NoModRef` for the histogram call against scalar `%p`,
+- scalarizing the intrinsic first produces `store i32 11, ptr %p` and `ret i32
+  11`,
+- running GVN first returns stale `10` across the intrinsic.
+
+This is a real miscompile. I rank it below the highest-priority items because
+the affected operation is an experimental vector intrinsic, but it is not an
+overflow-only or hand-wavy semantic issue.
+
+**Logical extensions checked**
+
+The same scalar-pointer assumption appears in the generic call-vs-call
+refinement in `AAResults::getModRefInfo(Call1, Call2)`: when an argmem-only
+call has pointer-vector arguments that cannot be represented as
+`MemoryLocation`s, accumulating over only scalar pointer arguments can also
+empty out a real dependence. A fix should preserve the original argmem effect
+or bail out conservatively when pointer-vector operands are present.
+
+`analysis/18` also checked masked gather/scatter. I agree with that result:
+they did not reproduce this bug because their memory effects are not narrowed
+to argmem-only in the same way, so BasicAA remains conservative through the
+`Other` memory path.
+
+### 5. BasicAA GEP Arithmetic And AliasResult Offsets
 
 **Analysis 06: two-variable `MinAbsVarIndex` overflow**
 
@@ -245,7 +290,7 @@ for a direction that should have the positive offset. Current GVN and DSE
 consumers guard against negative offsets before using them, so this is a missed
 optimization / invariant violation rather than a demonstrated miscompile.
 
-### 5. TBAA And Operand-Bundle Modeling
+### 6. TBAA And Operand-Bundle Modeling
 
 **Analysis 05: new-format TBAA access size ignored**
 
@@ -322,7 +367,7 @@ The operand-bundle issue appears in multiple layers:
 Those TBAA call-vs-call and immutable-call paths should be included in any fix
 or regression audit.
 
-### 6. Writability Inference
+### 7. Writability Inference
 
 **Analysis 10: `noalias` call returns treated as writable**
 
@@ -353,10 +398,10 @@ alone.
 
 ## Verification Notes
 
-I ran the available checked reproducers for `analysis/11`, `analysis/15`, and
-`analysis/17`, and directly inspected the optimized output for
-`analysis/16`. I also ran inline `opt` reproducers for `01`, `02`, `03`, `04`,
-`05`, `06`, `07`, `08`, `10`, `12`, and `13`.
+I ran the available checked reproducers for `analysis/11`, `analysis/15`,
+`analysis/17`, and `analysis/18`, and directly inspected the optimized output
+for `analysis/16`. I also ran inline `opt` reproducers for `01`, `02`, `03`,
+`04`, `05`, `06`, `07`, `08`, `10`, `12`, and `13`.
 
 Key local observations:
 

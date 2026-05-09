@@ -247,12 +247,13 @@ multiple purposes:
 
 1. `getUnderlyingObject` — find the base object (correct to look through `ptrmask`)
 2. `DecomposeGEPExpression` — compute exact byte offsets (**incorrect** to look through `ptrmask`)
-3. Capture analysis — track pointer provenance (correct to look through `ptrmask`)
-4. Noalias analysis — propagate noalias attributes (correct to look through `ptrmask`)
+3. `DetermineUseCaptureKind` — track pointer provenance (correct; uses `MustPreserveNullness=true` so already excludes `ptrmask`)
+4. `determinePointerAccessAttrs` — infer readonly/writeonly on function arguments (correct to look through `ptrmask`)
 
 The issue is that `ptrmask` preserves the **underlying object** but not the
-**exact address/offset**. For purposes 1, 3, and 4, looking through `ptrmask`
-is correct. For purpose 2 it is incorrect.
+**exact address/offset**. For purposes 1 and 4, looking through `ptrmask` is
+correct. Purpose 3 already excludes `ptrmask` via `MustPreserveNullness=true`.
+For purpose 2 it is incorrect.
 
 The same issue applies to `threadlocal_address` — it also appears in the
 helper and also changes the pointer address.
@@ -260,8 +261,8 @@ helper and also changes the pointer address.
 ### Intrinsic classification
 
 **Address-preserving** (safe for GEP decomposition):
-- `launder.invariant.group` — only affects TBAA metadata
-- `strip.invariant.group` — only affects TBAA metadata
+- `launder.invariant.group` — only affects invariant.group metadata, preserves address
+- `strip.invariant.group` — only affects invariant.group metadata, preserves address
 - `aarch64.irg` — adds random tag, preserves address bits
 - `aarch64.tagp` — transfers tag, preserves address bits
 - `amdgcn.make.buffer.rsrc` — creates buffer resource, preserves base address
