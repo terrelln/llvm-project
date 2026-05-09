@@ -1,8 +1,8 @@
 # Alias Analysis Submission Summary
 
 This reviews `prompt.md` and the submissions in `analysis/01` through
-`analysis/20`. I ignored `analysis/19` as a submission, but I did audit nearby
-code paths for logical extensions of the reported issues.
+`analysis/21`. I audited nearby code paths for logical extensions of the
+reported issues.
 
 Validation was based on source inspection and local `build/bin/opt` runs. Where
 the optimizer behavior reproduces but the IR/source proof depends on invalid or
@@ -22,6 +22,7 @@ counting it as a confirmed miscompile.
 | Medium-high | 20 | Confirmed real bug | TBAA call metadata drops explicit `errnomem` effects. |
 | Medium | 11 | Confirmed real bug | `GlobalsAA` function summaries ignore operand-bundle heap effects. IR-only trigger. |
 | Medium | 15 | Confirmed real bug | TBAA call metadata suppresses unknown operand-bundle effects. IR-only trigger. |
+| Medium | 21 | Confirmed real bug | `ObjCARCAA` drops unknown operand-bundle effects on ARC runtime calls. IR-only trigger. |
 | Medium-low | 12 | Confirmed real but niche | Distinct `extern_weak` globals can both resolve to valid null in `null_pointer_is_valid` functions. |
 | Low | 07 | Confirmed real but impractical | Matrix intrinsic memory extent can wrap to zero for huge stride. |
 | Low | 06 | Confirmed real but impractical | Two-variable `MinAbsVarIndex` reasoning can wrap for huge GEP indices. |
@@ -31,6 +32,7 @@ counting it as a confirmed miscompile.
 | Not validated | 09 | Semantics problem | Optimizer behavior reproduces, but current LangRef explicitly permits scoped-noalias fences. |
 | Not validated | 13 | Semantics ambiguous | Nullable `noalias` return behavior reproduces, but same-address stores may violate `noalias`. |
 | Not validated | 16 | Semantics problem | Scoped noalias masks errno in the test, but metadata/restrict semantics do not prove a defined aliasing case. |
+| Not validated | 19 | Semantics problem | `GlobalsAA` behavior reproduces, but the proof needs an external errno writer to modify an internal non-address-taken global. |
 
 ## Groups Of Similar Bugs
 
@@ -320,6 +322,27 @@ The supplied `analysis/11/reproducer.ll` folds the function to `ret i32 0` with
 `basic-aa,globals-aa` and EarlyCSE. This is valid IR but not C-reachable through
 ordinary Clang source.
 
+**Analysis 19: `GlobalsAA` per-global errno write tracking**
+
+The implementation concern is real enough to inspect: `GlobalsAA` has a
+`MayReadAnyGlobal` bit but no corresponding "may write any global" bit, and
+`getModRefInfoForGlobal()` can return only `Ref` for a tracked local global
+after a call chain containing an external `memory(errnomem: write)` function.
+Using `require<globals-aa>`, I reproduced the reported behavior:
+
+- `aa-eval` reports `Just Ref` for `call @wrapper` against `@my_errno`,
+- MemorySSA makes the final load a use of the earlier store, not the call,
+- GVN folds the function to `ret i32 0`.
+
+I do not validate this as a real miscompile as submitted. The reproducer's
+tracked object is `@my_errno = internal global i32 0`, whose address is not
+taken. An external `nosync nocallback` declaration such as `@fmodf` cannot
+access that internal global by ordinary IR visibility, and the report does not
+establish a defined way for this local global to be the target's actual errno
+object. For a normal external errno object, `GlobalsAA` would not have this same
+local-global precision path. This may still point at an abstraction mismatch in
+how `GlobalsAA` handles `ErrnoMem`, but the submitted proof is not sufficient.
+
 **Analysis 15: TBAA call metadata hides operand-bundle effects**
 
 This is confirmed. `TypeBasedAAResult::getModRefInfo(Call, Loc)` returns
@@ -369,6 +392,28 @@ ordinary typed call access, it must preserve independent effects such as
 `!llvm.errno.tbaa` named metadata make the intended separation visible:
 without errno-specific TBAA proving otherwise, `errno` effects must remain.
 
+**Analysis 21: `ObjCARCAA` drops operand-bundle effects**
+
+This is confirmed. `ObjCARCAAResult::getModRefInfo(Call, Loc)` returns
+`NoModRef` for several recognized ARC runtime calls, including
+`llvm.objc.retain`, because the ARC call itself does not access
+compiler-visible memory. That shortcut does not account for independent
+call-site operand-bundle effects.
+
+I verified `analysis/21/objc-arc-operand-bundle.ll`:
+
+- with `basic-aa` only, MemorySSA treats the unknown-bundle retain call as the
+  clobber and EarlyCSE keeps the load,
+- with `basic-aa,objc-arc-aa`, `aa-eval` reports `NoModRef` for the call
+  against `%p`,
+- MemorySSA rewires the load to the earlier store, and EarlyCSE returns stale
+  `1`.
+
+This is the same broad "AA provider erases operand-bundle effects" family as
+analyses 11 and 15, but the bad result comes from `ObjCARCAA` directly. The
+trigger is IR-only in the report, and `objc-arc-aa` is not in the default new
+pass manager AA pipeline, so I rank it as medium rather than high.
+
 **Analysis 16: scoped-noalias masking errno effects**
 
 The optimizer behavior reproduces: a call declared `memory(errnomem: write)`
@@ -396,6 +441,8 @@ The operand-bundle issue appears in multiple layers:
   `TypeBasedAAResult::getModRefInfo(Call, Call)`, and the immutable-type
   `getMemoryEffects(Call)` path can all suppress effects without preserving
   operand-bundle memory or explicit `ErrnoMem` effects.
+- `ObjCARCAAResult::getModRefInfo(Call, Loc)` can return `NoModRef` for ARC
+  runtime calls without preserving operand-bundle effects.
 
 Those TBAA call-vs-call and immutable-call paths should be included in any fix
 or regression audit. For errno specifically, the fix should reuse the same
@@ -434,14 +481,18 @@ alone.
 ## Verification Notes
 
 I ran the available checked reproducers for `analysis/11`, `analysis/15`,
-`analysis/17`, `analysis/18`, and `analysis/20`, and directly inspected the
-optimized output for `analysis/16`. I also ran inline `opt` reproducers for
-`01`, `02`, `03`, `04`, `05`, `06`, `07`, `08`, `10`, `12`, and `13`.
+`analysis/17`, `analysis/18`, `analysis/20`, and `analysis/21`, and directly
+inspected the optimized output for `analysis/16` and `analysis/19`. I also ran
+inline `opt` reproducers for `01`, `02`, `03`, `04`, `05`, `06`, `07`, `08`,
+`10`, `12`, and `13`.
 
 Key local observations:
 
 - `analysis/03` reports `PartialAlias`, not the claimed `NoAlias`.
 - `analysis/09` and `analysis/16` reproduce the optimized output claimed by the
   reports, but the semantic proof is not sufficient under current LangRef.
+- `analysis/19` reproduces the `GlobalsAA` precision issue, but the submitted
+  IR does not prove that an external errno-writing call can modify the internal
+  non-address-taken global used as the queried object.
 - The additional `experimental_memset_pattern` extension produces the same
   `NoModRef`/stale-return shape as the matrix size overflow family.
