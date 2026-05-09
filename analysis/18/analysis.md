@@ -44,3 +44,26 @@ analysis: `aa-eval` reports `Mod` for masked scatter and `Ref` for masked gather
 against the alloca, and EarlyCSE does not forward across the intrinsic. The
 candidate file is kept as `reproducer.ll` for reference, but this is not the
 bug.
+
+## Rejected: `allocsize` as malloc-like side effect suppression
+
+I also checked whether the malloc/calloc-like `BasicAA` shortcut accidentally
+applies to arbitrary `allocsize` functions with visible side effects. It does
+not reproduce: `isMallocOrCallocLikeFn()` does not use the generic `allocsize`
+path, and `aa-eval` reports `ModRef` for a custom `noalias allocsize(0)`
+declaration against a global.
+
+## Candidate: vector histogram intrinsics with vector-of-pointer operands
+
+`llvm.experimental.vector.histogram.*` intrinsics are declared as accessing
+argument memory only. Their memory operand is a vector of pointers (`<N x ptr>`),
+not a scalar pointer. `BasicAAResult::getModRefInfo(Call, Loc)` refines
+argument-memory effects by iterating `Call->data_ops()` and considering only
+operands whose type satisfies `isPointerTy()`. If an argmem-only intrinsic has
+no scalar pointer operands, `NewArgMR` remains `NoModRef`, so `BasicAA` can
+erase the intrinsic's whole memory effect for any scalar queried location.
+
+This differs from the rejected masked gather/scatter case: those intrinsics are
+not modeled as argmem-only, so the "other memory" path remains conservative.
+The histogram intrinsics are argmem-only, which makes the scalar-pointer-only
+refinement unsound.

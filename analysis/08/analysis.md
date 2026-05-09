@@ -240,12 +240,44 @@ store i8 42, ptr %add.ptr1, align 1
 ret i8 7
 ```
 
+## Root cause
+
+`isIntrinsicReturningPointerAliasingArgumentWithoutCapturing` is used for
+multiple purposes:
+
+1. `getUnderlyingObject` — find the base object (correct to look through `ptrmask`)
+2. `DecomposeGEPExpression` — compute exact byte offsets (**incorrect** to look through `ptrmask`)
+3. Capture analysis — track pointer provenance (correct to look through `ptrmask`)
+4. Noalias analysis — propagate noalias attributes (correct to look through `ptrmask`)
+
+The issue is that `ptrmask` preserves the **underlying object** but not the
+**exact address/offset**. For purposes 1, 3, and 4, looking through `ptrmask`
+is correct. For purpose 2 it is incorrect.
+
+The same issue applies to `threadlocal_address` — it also appears in the
+helper and also changes the pointer address.
+
+### Intrinsic classification
+
+**Address-preserving** (safe for GEP decomposition):
+- `launder.invariant.group` — only affects TBAA metadata
+- `strip.invariant.group` — only affects TBAA metadata
+- `aarch64.irg` — adds random tag, preserves address bits
+- `aarch64.tagp` — transfers tag, preserves address bits
+- `amdgcn.make.buffer.rsrc` — creates buffer resource, preserves base address
+
+**Object-preserving only** (NOT safe for GEP decomposition):
+- `ptrmask` — masks address bits, can change offset by arbitrary amount
+- `threadlocal_address` — computes thread-local address, changes base
+
 ## Fix
 
 Do not use `getArgumentAliasingToReturnedPointer(Call, false)` as a blanket
 "same symbolic address" rule in `DecomposeGEPExpression()`.
 
-The conservative fix is to stop GEP decomposition at `llvm.ptrmask`:
+### Option A: Special-case in `DecomposeGEPExpression` (conservative)
+
+Stop GEP decomposition at `llvm.ptrmask`:
 
 ```cpp
 if (const auto *Call = dyn_cast<CallBase>(V)) {
@@ -262,14 +294,56 @@ if (const auto *Call = dyn_cast<CallBase>(V)) {
 }
 ```
 
-A cleaner fix is to split the helper into two concepts:
+This is targeted but doesn't address the general issue or `threadlocal_address`.
+
+### Option B: New helper distinguishing "preserves address" (recommended)
+
+Split the helper into two concepts:
 
 ```text
 1. same underlying object / returned provenance
 2. same address, modulo the pointer index type
 ```
 
-BasicAA GEP decomposition needs the second property. `launder.invariant.group`
-and `strip.invariant.group` can be treated as address-preserving; `ptrmask`
-cannot, unless BasicAA separately proves that the mask is a no-op for all
-possible low bits of the pointer.
+BasicAA GEP decomposition needs the second property.
+
+```cpp
+// In ValueTracking.cpp
+bool llvm::isIntrinsicReturningPointerPreservingAddress(
+    const CallBase *Call) {
+  switch (Call->getIntrinsicID()) {
+  case Intrinsic::launder_invariant_group:
+  case Intrinsic::strip_invariant_group:
+  case Intrinsic::aarch64_irg:
+  case Intrinsic::aarch64_tagp:
+  case Intrinsic::amdgcn_make_buffer_rsrc:
+    return true;
+  // ptrmask and threadlocal_address are NOT included
+  default:
+    return false;
+  }
+}
+
+// In BasicAliasAnalysis.cpp, DecomposeGEPExpression
+} else if (const auto *Call = dyn_cast<CallBase>(V)) {
+  if (auto *RP = getArgumentAliasingToReturnedPointer(Call, false)) {
+    if (isIntrinsicReturningPointerPreservingAddress(Call)) {
+      V = RP;
+      continue;
+    }
+  }
+}
+```
+
+This correctly handles `ptrmask`, `threadlocal_address`, and any future
+intrinsics that preserve the underlying object but not the address.
+
+## Testing
+
+Beyond `aa-eval` and `gvn`, the following passes also rely on BasicAA and
+should be tested to ensure the fix doesn't break valid optimizations:
+
+- `early-cse` — uses MemorySSA which relies on alias analysis
+- `dse` — dead store elimination relies on alias analysis
+- `licm` — loop invariant code motion
+- `memcpyopt` — memcpy optimization
