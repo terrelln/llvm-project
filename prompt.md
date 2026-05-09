@@ -10,7 +10,10 @@ Your job is to:
 * Provide LLVM-IR that exposes the bug and produces a mis-compilation
 * Provide a fix for the bug (but DO NOT MODIFY the source code)
 
-Please write your analysis into the next unwritten file under `analysis/`. E.g. `analysis/2026-05-08-alias-analysis-XX.md` where `XX` is the next available number.
+Please write your analysis into the next available directory under `analysis/`.
+E.g. `analysis/XX/`, where `XX` is the next available number.
+The analysis markdown should go in `analysis.md` in that dir.
+And please create any other files, like reproducers, in that directory as needed.
 Keep the analysis file updatead as you progress.
 Make sure to update it when you've found a candidate bug, not just when you've finished your analysis.
 
