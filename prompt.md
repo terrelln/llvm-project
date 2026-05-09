@@ -12,6 +12,8 @@ Your job is to:
 
 Please write your analysis into the next available directory under `analysis/`.
 E.g. `analysis/XX/`, where `XX` is the next available number.
+If an empty directory exists, assume it is reserved for another user and skip it.
+Make sure to create the analysis directory before starting any other work, to reserve the slot.
 The analysis markdown should go in `analysis.md` in that dir.
 And please create any other files, like reproducers, in that directory as needed.
 Keep the analysis file updatead as you progress.
